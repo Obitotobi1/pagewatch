@@ -72,7 +72,7 @@ a{color:var(--acc)}
       </div>
       <p class="mono" style="margin:10px 0 0">A: <span id="addrA"></span></p>
       <p class="mono" style="margin:2px 0 0">B: <span id="addrB"></span></p>
-      <small>Demo accounts are generated in your browser and kept in local storage. They are free on Studio. Only the owner can confirm the baseline or retire a watch. Anyone, with any account, can re-check.</small>
+      <small><b>Scope:</b> this is a GenLayer <b>Studio test-network demo</b>. It uses throwaway demo accounts on purpose (no wallet, no funds, nothing to recover), so anyone can try it in two minutes. The contract itself is wallet-agnostic: any account can call it. Demo accounts are generated in your browser and kept in local storage. They are free on Studio. Only the owner can confirm the baseline or retire a watch. Anyone, with any account, can re-check.</small>
     </div>
 
     <div class="tabs">
@@ -157,23 +157,52 @@ function logTx(id, html, cls = "") {
   el.innerHTML = html;
 }
 
-// Full lifecycle: sign -> submitted -> consensus (ACCEPTED) -> FINALIZED.
-async function send(label, functionName, args, note) {
+// Reads the failure signal out of a receipt, whichever field names the SDK version uses.
+function execFailure(rcpt) {
+  const bits = [rcpt?.txExecutionResultName, rcpt?.resultName, rcpt?.result_name, rcpt?.statusName, rcpt?.data?.execution_result]
+    .filter((x) => typeof x === "string");
+  const bad = bits.find((x) => /ERROR|FAIL|REVERT|ROLLBACK/i.test(x));
+  return bad || "";
+}
+
+// Three separate stages, shown as separate lines:
+//  1 EXECUTED   the contract call ran (or reverted) - checked from the receipt and from on-chain state
+//  2 ACCEPTED   validators reached consensus on that result
+//  3 FINALIZED  the result can no longer be appealed or changed
+// `probe` (optional) reads the relevant on-chain record before and after, so the app can say
+// plainly whether the transaction actually changed anything.
+async function send(label, functionName, args, note, probe) {
   const id = Date.now() + Math.random().toString(16).slice(2, 6);
+  const head = `<b>${esc(label)}</b><br>`;
+  const line = (ok, text) => `<div>${ok === true ? "<span style='color:var(--ok)'>✔</span>" : ok === false ? "<span class='err'>✖</span>" : "<span class='mute'>…</span>"} ${text}</div>`;
   try {
-    logTx(id, `<b>${esc(label)}</b><br>1/3 Signing and submitting…`);
+    let before = null;
+    if (probe) { try { before = await probe(); } catch { before = null; } }
+    logTx(id, head + line(null, "Signing and submitting…"));
     const hash = await client.writeContract({ address: addr(), functionName, args, value: 0n });
-    const base = `<b>${esc(label)}</b><br><span class="mono">${esc(hash)}</span><br>`;
-    logTx(id, base + "2/3 Submitted. " + (note || "Waiting for validators to reach consensus…"));
-    await client.waitForTransactionReceipt({ hash, status: "ACCEPTED", retries: 120, interval: 3000 });
-    logTx(id, base + "3/3 <b style='color:var(--ok)'>Accepted by consensus.</b> Waiting for finality…");
+    const h = `<span class="mono">${esc(hash)}</span>`;
+    logTx(id, head + h + line(true, "Submitted") + line(null, note || "Waiting for validators to reach consensus…"));
+    const rcpt = await client.waitForTransactionReceipt({ hash, status: "ACCEPTED", retries: 120, interval: 3000 });
+    const fail = execFailure(rcpt);
+    let effect = "";
+    let changed = true;
+    if (probe && before !== null) {
+      try { const after = await probe(); changed = JSON.stringify(after) !== JSON.stringify(before); } catch { /* keep default */ }
+    }
+    if (fail) {
+      logTx(id, head + h + line(true, "Submitted") + line(false, `<b>Execution failed</b> (${esc(fail)}). Nothing was changed on-chain.`) + line(null, "Waiting for finality…"), "err");
+    } else if (!changed) {
+      logTx(id, head + h + line(true, "Submitted") + line(true, "Executed, validators accepted it") + line(false, "<b>No change was stored.</b> The call ran but the contract's record is the same (for example the validators did not agree, or the page could not be read). Try again.") + line(null, "Waiting for finality…"));
+    } else {
+      logTx(id, head + h + line(true, "Submitted") + line(true, "<b>Executed OK</b> and <b>accepted by validator consensus</b>") + line(null, "Waiting for finality (it can still be appealed until then)…"));
+    }
     await refresh();
     client.waitForTransactionReceipt({ hash, status: "FINALIZED", retries: 200, interval: 5000 })
-      .then(() => logTx(id, base + "<b style='color:var(--ok)'>Finalized.</b>"))
-      .catch(() => logTx(id, base + "Accepted. Finality is still pending."));
-    return true;
+      .then(() => logTx(id, head + h + line(true, "Submitted") + (fail ? line(false, "Execution failed, nothing changed") : changed ? line(true, "Executed OK, accepted by consensus") : line(false, "No change was stored")) + line(true, "<b>Finalized</b>: this result is now permanent."), fail || !changed ? "err" : ""))
+      .catch(() => logTx(id, head + h + line(true, "Accepted") + line(null, "Finality is still pending.")));
+    return !fail;
   } catch (e) {
-    logTx(id, `<b>${esc(label)}</b><br><span class="err">Failed: ${esc(e?.shortMessage || e?.message || e)}</span>`, "err");
+    logTx(id, head + `<span class="err">Failed before it reached the chain: ${esc(e?.shortMessage || e?.message || e)}</span>`, "err");
     return false;
   }
 }
@@ -222,6 +251,8 @@ async function refresh() {
   refreshBoard();
 }
 
+const probeWatch = (id) => async () => { const r = await readJson("get_watch", [id]); return { status: r.status, checks: r.checks, history: r.history }; };
+
 function renderDetail(w, d) {
   d.hidden = false;
   const mine = w.owner.toLowerCase() === accounts[current].address.toLowerCase();
@@ -246,8 +277,8 @@ function renderDetail(w, d) {
     </div>`;
   const after = () => { refresh(); };
   const b = $("baseBtn_" + w.id), r = $("reBtn_" + w.id), t = $("retBtn_" + w.id);
-  if (b) b.onclick = () => send(`Confirm baseline #${w.id}`, "confirm_baseline", [w.id], "Validators are reading the page and agreeing on whether the sentence is there. This can take a minute or two.").then(after);
-  if (r) r.onclick = () => send(`Re-check watch #${w.id}`, "recheck", [w.id], "Validators are fetching the page again. This can take a minute or two.").then(after);
+  if (b) b.onclick = () => send(`Confirm baseline #${w.id}`, "confirm_baseline", [w.id], "Validators are reading the page and agreeing on whether the sentence is there. This can take a minute or two.", probeWatch(w.id)).then(after);
+  if (r) r.onclick = () => send(`Re-check watch #${w.id}`, "recheck", [w.id], "Validators are fetching the page again. This can take a minute or two.", probeWatch(w.id)).then(after);
   if (t) t.onclick = () => { if (confirm("Retire this watch? Re-checks will stop.")) send(`Retire watch #${w.id}`, "retire", [w.id]).then(after); };
 }
 
