@@ -157,50 +157,67 @@ function logTx(id, html, cls = "") {
   el.innerHTML = html;
 }
 
-// Reads the failure signal out of a receipt, whichever field names the SDK version uses.
-function execFailure(rcpt) {
-  const bits = [rcpt?.txExecutionResultName, rcpt?.resultName, rcpt?.result_name, rcpt?.statusName, rcpt?.data?.execution_result]
-    .filter((x) => typeof x === "string");
-  const bad = bits.find((x) => /ERROR|FAIL|REVERT|ROLLBACK/i.test(x));
-  return bad || "";
+// ---- Outcome classification: success is a WHITELIST. Anything else is shown under its real name. ----
+const OK_STATUS = ["ACCEPTED", "FINALIZED"];
+const BAD_RESULT = /DISAGREE|TIMEOUT|NO_MAJORITY|VIOLATION|UNDETERMINED|CANCEL|REJECT|ERROR|FAIL|REVERT|ROLLBACK/i;
+const up = (x) => (typeof x === "string" ? x.toUpperCase() : "");
+
+// Returns { ok, label, detail }. ok is true ONLY when the network reports an accepted/finalized
+// status, no failure signal, and the on-chain record really changed.
+function classifyOutcome(rcpt, changed) {
+  const status = up(rcpt?.statusName) || up(rcpt?.status_name);
+  const results = [rcpt?.resultName, rcpt?.result_name, rcpt?.txExecutionResultName, rcpt?.data?.execution_result].map(up).filter(Boolean);
+  const bad = results.find((x) => BAD_RESULT.test(x));
+  if (status && !OK_STATUS.includes(status)) {
+    const names = { UNDETERMINED: "Undetermined: validators could not reach a decision", CANCELED: "Canceled", LEADER_TIMEOUT: "Timeout: the leader did not answer in time", VALIDATORS_TIMEOUT: "Timeout: validators did not answer in time" };
+    return { ok: false, label: names[status] || ("Not accepted: status " + status), detail: "No result was stored. The record on-chain is unchanged." };
+  }
+  if (bad) {
+    const names = { DISAGREE: "Validators disagreed", MAJORITY_DISAGREE: "Validators disagreed", NO_MAJORITY: "No majority among validators" };
+    const k = Object.keys(names).find((n) => bad.includes(n));
+    return { ok: false, label: k ? names[k] : ("Not successful: " + bad), detail: "No result was stored. The record on-chain is unchanged." };
+  }
+  if (changed === false) return { ok: false, label: "Ran, but no change was stored", detail: "The record is identical before and after. Validators may not have agreed, or the page could not be read. Try again." };
+  if (changed === null) return { ok: false, label: "Outcome could not be verified", detail: "The network did not confirm an accepted result and the record could not be read back. Check the transaction in the Explorer before relying on it." };
+  if (!status) return { ok: true, label: "Record changed on-chain", detail: "The network did not report a consensus status, so acceptance is inferred only from the stored change." };
+  return { ok: true, label: status === "FINALIZED" ? "Finalized" : "Accepted by validator consensus", detail: "" };
 }
 
-// Three separate stages, shown as separate lines:
-//  1 EXECUTED   the contract call ran (or reverted) - checked from the receipt and from on-chain state
-//  2 ACCEPTED   validators reached consensus on that result
-//  3 FINALIZED  the result can no longer be appealed or changed
-// `probe` (optional) reads the relevant on-chain record before and after, so the app can say
-// plainly whether the transaction actually changed anything.
+// Stages shown as separate lines: Submitted, Outcome (from the classification), Finality.
 async function send(label, functionName, args, note, probe) {
   const id = Date.now() + Math.random().toString(16).slice(2, 6);
   const head = `<b>${esc(label)}</b><br>`;
   const line = (ok, text) => `<div>${ok === true ? "<span style='color:var(--ok)'>✔</span>" : ok === false ? "<span class='err'>✖</span>" : "<span class='mute'>…</span>"} ${text}</div>`;
+  const read = async () => { if (!probe) return undefined; try { return JSON.stringify(await probe()); } catch { return null; } };
   try {
-    let before = null;
-    if (probe) { try { before = await probe(); } catch { before = null; } }
+    const before = await read();
     logTx(id, head + line(null, "Signing and submitting…"));
     const hash = await client.writeContract({ address: addr(), functionName, args, value: 0n });
     const h = `<span class="mono">${esc(hash)}</span>`;
     logTx(id, head + h + line(true, "Submitted") + line(null, note || "Waiting for validators to reach consensus…"));
-    const rcpt = await client.waitForTransactionReceipt({ hash, status: "ACCEPTED", retries: 120, interval: 3000 });
-    const fail = execFailure(rcpt);
-    let effect = "";
-    let changed = true;
-    if (probe && before !== null) {
-      try { const after = await probe(); changed = JSON.stringify(after) !== JSON.stringify(before); } catch { /* keep default */ }
+    let rcpt;
+    try {
+      rcpt = await client.waitForTransactionReceipt({ hash, status: "ACCEPTED", retries: 120, interval: 3000 });
+    } catch (e) {
+      logTx(id, head + h + line(true, "Submitted") + line(false, "<b>Timed out waiting for the network.</b> Nothing is confirmed. The transaction may still complete: reload and check, or look it up in the Explorer.") , "err");
+      return false;
     }
-    if (fail) {
-      logTx(id, head + h + line(true, "Submitted") + line(false, `<b>Execution failed</b> (${esc(fail)}). Nothing was changed on-chain.`) + line(null, "Waiting for finality…"), "err");
-    } else if (!changed) {
-      logTx(id, head + h + line(true, "Submitted") + line(true, "Executed, validators accepted it") + line(false, "<b>No change was stored.</b> The call ran but the contract's record is the same (for example the validators did not agree, or the page could not be read). Try again.") + line(null, "Waiting for finality…"));
-    } else {
-      logTx(id, head + h + line(true, "Submitted") + line(true, "<b>Executed OK</b> and <b>accepted by validator consensus</b>") + line(null, "Waiting for finality (it can still be appealed until then)…"));
-    }
+    const after = await read();
+    const changed = probe ? (before === null || after === null ? null : before !== after) : true;
+    const out = classifyOutcome(rcpt, changed);
+    logTx(id, head + h + line(true, "Submitted") + line(out.ok, `<b>${esc(out.label)}</b>`) + (out.detail ? `<div class="mute"><small>${esc(out.detail)}</small></div>` : "") + (out.ok ? line(null, "Waiting for finality (it can still be appealed until then)…") : ""), out.ok ? "" : "err");
     await refresh();
+    if (!out.ok) return false;
     client.waitForTransactionReceipt({ hash, status: "FINALIZED", retries: 200, interval: 5000 })
-      .then(() => logTx(id, head + h + line(true, "Submitted") + (fail ? line(false, "Execution failed, nothing changed") : changed ? line(true, "Executed OK, accepted by consensus") : line(false, "No change was stored")) + line(true, "<b>Finalized</b>: this result is now permanent."), fail || !changed ? "err" : ""))
-      .catch(() => logTx(id, head + h + line(true, "Accepted") + line(null, "Finality is still pending.")));
-    return !fail;
+      .then(async (fin) => {
+        const f = classifyOutcome(fin, changed);
+        const finalStatus = up(fin?.statusName) || up(fin?.status_name);
+        const reallyFinal = finalStatus === "FINALIZED";
+        logTx(id, head + h + line(true, "Submitted") + line(f.ok, `<b>${esc(f.ok ? out.label : f.label)}</b>`) + (reallyFinal && f.ok ? line(true, "<b>Finalized</b>: this result is now permanent.") : line(f.ok ? null : false, f.ok ? "Finality not confirmed by the network yet." : esc(f.detail || "The final result is not a success."))), f.ok ? "" : "err");
+        refresh();
+      })
+      .catch(() => logTx(id, head + h + line(true, "Submitted") + line(out.ok, `<b>${esc(out.label)}</b>`) + line(null, "Finality is still pending. Check again later.")));
+    return true;
   } catch (e) {
     logTx(id, head + `<span class="err">Failed before it reached the chain: ${esc(e?.shortMessage || e?.message || e)}</span>`, "err");
     return false;
